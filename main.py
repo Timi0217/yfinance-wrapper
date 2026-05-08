@@ -7,6 +7,22 @@ from typing import Optional
 app = FastAPI(title="yfinance Wrapper API")
 
 
+@app.get("/")
+async def root():
+    """API overview"""
+    return {
+        "name": "yfinance Wrapper",
+        "description": "Stock quotes, historical OHLCV data, company fundamentals, and forex rates via yfinance",
+        "endpoints": [
+            {"path": "/quote?symbol=AAPL", "description": "Get current stock quote"},
+            {"path": "/history?symbol=AAPL&period=6mo", "description": "Get historical OHLCV data"},
+            {"path": "/fundamentals?symbol=AAPL", "description": "Get company fundamentals"},
+            {"path": "/forex?from_currency=USD&to_currency=EUR", "description": "Get forex conversion rate"},
+            {"path": "/health", "description": "Health check"}
+        ]
+    }
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
