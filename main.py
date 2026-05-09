@@ -1,199 +1,241 @@
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
-from datetime import datetime
-import yfinance as yf
-from typing import Optional
+"""
+Yahoo Finance Wrapper — direct HTTP API, no yfinance library.
 
-app = FastAPI(title="yfinance Wrapper API")
+Uses Yahoo Finance v8 chart API for quotes, history, and forex.
+Fundamentals are handled by the Finnhub wrapper (this wrapper does not
+need to duplicate that functionality).
+"""
+
+from fastapi import FastAPI, HTTPException, Query
+from datetime import datetime, timezone
+import httpx
+import os
+
+app = FastAPI(title="Yahoo Finance Wrapper API")
+
+_YF_BASE = "https://query1.finance.yahoo.com"
+_UA = "Mozilla/5.0 (compatible; ChekkAgent/1.0)"
+_TIMEOUT = float(os.environ.get("YF_TIMEOUT", "8"))
+
+# Re-usable async client (connection pooling)
+_client: httpx.AsyncClient | None = None
+
+
+async def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            follow_redirects=True,
+            headers={"User-Agent": _UA},
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=10),
+        )
+    return _client
+
+
+async def _chart(symbol: str, range_: str = "1d", interval: str = "1d") -> dict:
+    """Call Yahoo Finance v8 chart API and return the first result."""
+    client = await _get_client()
+    url = f"{_YF_BASE}/v8/finance/chart/{symbol}"
+    params = {"range": range_, "interval": interval}
+    resp = await client.get(url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+    chart = data.get("chart", {})
+    error = chart.get("error")
+    if error:
+        raise HTTPException(status_code=404, detail=error.get("description", str(error)))
+    results = chart.get("result", [])
+    if not results:
+        raise HTTPException(status_code=404, detail=f"No data for symbol '{symbol}'")
+    return results[0]
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────
 
 
 @app.get("/")
 async def root():
-    """API overview"""
     return {
-        "name": "yfinance Wrapper",
-        "description": "Stock quotes, historical OHLCV data, company fundamentals, and forex rates via yfinance",
+        "name": "Yahoo Finance Wrapper",
+        "version": "2.0",
+        "description": "Stock quotes, historical OHLCV, and forex via Yahoo Finance HTTP API",
         "endpoints": [
-            {"path": "/quote?symbol=AAPL", "description": "Get current stock quote"},
-            {"path": "/history?symbol=AAPL&period=6mo", "description": "Get historical OHLCV data"},
-            {"path": "/fundamentals?symbol=AAPL", "description": "Get company fundamentals"},
-            {"path": "/forex?from_currency=USD&to_currency=EUR", "description": "Get forex conversion rate"},
-            {"path": "/health", "description": "Health check"}
-        ]
+            {"path": "/quote?symbol=AAPL", "description": "Current stock quote"},
+            {"path": "/history?symbol=AAPL&period=6mo", "description": "Historical OHLCV"},
+            {"path": "/fundamentals?symbol=AAPL", "description": "Basic fundamentals from chart meta"},
+            {"path": "/forex?from_currency=USD&to_currency=EUR&amount=100", "description": "Forex rate"},
+            {"path": "/health", "description": "Health check"},
+        ],
     }
 
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
+async def health():
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/quote")
-async def get_quote(symbol: str = Query(..., description="Stock symbol (e.g., AAPL)")):
-    """Get current stock quote with price, change, volume, and basic info"""
+async def get_quote(symbol: str = Query(..., description="Stock symbol (e.g. AAPL)")):
+    """Current price quote via v8 chart API."""
     try:
-        ticker = yf.Ticker(symbol)
+        result = await _chart(symbol.upper(), range_="1d", interval="1d")
+        meta = result.get("meta", {})
 
-        # Try to get data from both info and fast_info
-        try:
-            info = ticker.info
-            fast_info = ticker.fast_info
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found or data unavailable")
+        price = meta.get("regularMarketPrice")
+        prev_close = meta.get("chartPreviousClose") or meta.get("previousClose")
 
-        # Check if we got valid data
-        if not info or info.get('regularMarketPrice') is None:
-            if not fast_info or not hasattr(fast_info, 'last_price'):
-                raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found")
+        change = round(price - prev_close, 4) if price and prev_close else None
+        change_pct = round((change / prev_close) * 100, 4) if change and prev_close else None
 
-        # Build response using available data
-        response = {
-            "symbol": symbol.upper(),
-            "price": getattr(fast_info, 'last_price', None) or info.get('regularMarketPrice') or info.get('currentPrice'),
-            "change": info.get('regularMarketChange'),
-            "change_pct": info.get('regularMarketChangePercent'),
-            "volume": getattr(fast_info, 'last_volume', None) or info.get('regularMarketVolume') or info.get('volume'),
-            "market_cap": info.get('marketCap'),
-            "currency": info.get('currency') or info.get('financialCurrency'),
-            "exchange": getattr(fast_info, 'exchange', None) or info.get('exchange'),
-            "name": info.get('longName') or info.get('shortName'),
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+        # Try to pull today's high/low/open from indicators
+        quotes = result.get("indicators", {}).get("quote", [{}])[0]
+        highs = quotes.get("high", [])
+        lows = quotes.get("low", [])
+        opens = quotes.get("open", [])
+        volumes = quotes.get("volume", [])
+
+        return {
+            "symbol": meta.get("symbol", symbol.upper()),
+            "current_price": price,
+            "change": change,
+            "percent_change": change_pct,
+            "high": highs[-1] if highs else None,
+            "low": lows[-1] if lows else None,
+            "open": opens[-1] if opens else None,
+            "previous_close": prev_close,
+            "volume": volumes[-1] if volumes else None,
+            "currency": meta.get("currency"),
+            "exchange": meta.get("exchangeName"),
+            "name": meta.get("longName") or meta.get("shortName"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-
-        return response
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"yfinance service error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Yahoo Finance error: {e}")
 
 
 @app.get("/history")
 async def get_history(
-    symbol: str = Query(..., description="Stock symbol (e.g., AAPL)"),
-    period: str = Query("6mo", description="Period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, ytd, max")
+    symbol: str = Query(..., description="Stock symbol"),
+    period: str = Query("6mo", description="1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y, ytd, max"),
 ):
-    """Get historical OHLCV data"""
-    valid_periods = ["1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "ytd", "max"]
+    """Historical OHLCV data."""
+    valid = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "ytd", "max"}
+    if period not in valid:
+        raise HTTPException(status_code=400, detail=f"Invalid period. Use one of: {', '.join(sorted(valid))}")
 
-    if period not in valid_periods:
-        raise HTTPException(status_code=400, detail=f"Invalid period. Must be one of: {', '.join(valid_periods)}")
+    # Pick interval based on period length
+    interval_map = {
+        "1d": "5m", "5d": "30m",
+        "1mo": "1d", "3mo": "1d", "6mo": "1d",
+        "1y": "1d", "2y": "1wk", "5y": "1wk",
+        "ytd": "1d", "max": "1mo",
+    }
+    interval = interval_map.get(period, "1d")
 
     try:
-        ticker = yf.Ticker(symbol)
-        hist = ticker.history(period=period)
+        result = await _chart(symbol.upper(), range_=period, interval=interval)
+        timestamps = result.get("timestamp", [])
+        quotes = result.get("indicators", {}).get("quote", [{}])[0]
 
-        if hist.empty:
-            raise HTTPException(status_code=404, detail=f"No data found for symbol '{symbol}'")
+        opens = quotes.get("open", [])
+        highs = quotes.get("high", [])
+        lows = quotes.get("low", [])
+        closes = quotes.get("close", [])
+        volumes = quotes.get("volume", [])
 
-        # Convert DataFrame to list of dicts
         data = []
-        for date, row in hist.iterrows():
+        for i, ts in enumerate(timestamps):
             data.append({
-                "date": date.isoformat(),
-                "open": float(row['Open']) if not pd.isna(row['Open']) else None,
-                "high": float(row['High']) if not pd.isna(row['High']) else None,
-                "low": float(row['Low']) if not pd.isna(row['Low']) else None,
-                "close": float(row['Close']) if not pd.isna(row['Close']) else None,
-                "volume": int(row['Volume']) if not pd.isna(row['Volume']) else None
+                "date": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d"),
+                "open": round(opens[i], 4) if i < len(opens) and opens[i] is not None else None,
+                "high": round(highs[i], 4) if i < len(highs) and highs[i] is not None else None,
+                "low": round(lows[i], 4) if i < len(lows) and lows[i] is not None else None,
+                "close": round(closes[i], 4) if i < len(closes) and closes[i] is not None else None,
+                "volume": volumes[i] if i < len(volumes) and volumes[i] is not None else None,
             })
 
         return {
             "symbol": symbol.upper(),
             "period": period,
+            "interval": interval,
+            "data_points": len(data),
             "data": data,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"yfinance service error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Yahoo Finance error: {e}")
 
 
 @app.get("/fundamentals")
-async def get_fundamentals(symbol: str = Query(..., description="Stock symbol (e.g., AAPL)")):
-    """Get company fundamentals and financial metrics"""
+async def get_fundamentals(symbol: str = Query(..., description="Stock symbol")):
+    """Basic fundamentals from chart metadata (PE, market cap, 52w range).
+
+    For full fundamentals, use the Finnhub wrapper.
+    """
     try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
+        result = await _chart(symbol.upper(), range_="1y", interval="1d")
+        meta = result.get("meta", {})
+        quotes = result.get("indicators", {}).get("quote", [{}])[0]
+        closes = [c for c in quotes.get("close", []) if c is not None]
 
-        if not info or not info.get('symbol'):
-            raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found")
-
-        response = {
-            "symbol": symbol.upper(),
-            "pe_ratio": info.get('trailingPE') or info.get('forwardPE'),
-            "forward_pe": info.get('forwardPE'),
-            "eps": info.get('trailingEps') or info.get('epsTrailingTwelveMonths'),
-            "revenue": info.get('totalRevenue'),
-            "market_cap": info.get('marketCap'),
-            "dividend_yield": info.get('dividendYield'),
-            "beta": info.get('beta'),
-            "sector": info.get('sector'),
-            "industry": info.get('industry'),
-            "description": info.get('longBusinessSummary'),
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+        return {
+            "symbol": meta.get("symbol", symbol.upper()),
+            "name": meta.get("longName") or meta.get("shortName"),
+            "currency": meta.get("currency"),
+            "exchange": meta.get("exchangeName"),
+            "current_price": meta.get("regularMarketPrice"),
+            "previous_close": meta.get("chartPreviousClose"),
+            "52w_high": max(closes) if closes else None,
+            "52w_low": min(closes) if closes else None,
+            "data_granularity": meta.get("dataGranularity"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-
-        return response
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"yfinance service error: {str(e)}")
+        raise HTTPException(status_code=503, detail=f"Yahoo Finance error: {e}")
 
 
 @app.get("/forex")
 async def get_forex(
-    from_currency: str = Query(..., description="Source currency (e.g., USD)"),
-    to_currency: str = Query(..., description="Target currency (e.g., EUR)"),
-    amount: float = Query(1.0, description="Amount to convert")
+    from_currency: str = Query(..., description="Source currency (e.g. USD)"),
+    to_currency: str = Query(..., description="Target currency (e.g. EUR)"),
+    amount: float = Query(1.0, description="Amount to convert"),
 ):
-    """Get forex conversion rate and converted amount"""
+    """Forex conversion rate via Yahoo Finance currency pairs."""
+    pair = f"{from_currency.upper()}{to_currency.upper()}=X"
     try:
-        # yfinance uses format: USDEUR=X
-        forex_symbol = f"{from_currency.upper()}{to_currency.upper()}=X"
-
-        ticker = yf.Ticker(forex_symbol)
-
-        # Get current rate
-        try:
-            fast_info = ticker.fast_info
-            rate = getattr(fast_info, 'last_price', None)
-        except:
-            rate = None
+        result = await _chart(pair, range_="1d", interval="1d")
+        meta = result.get("meta", {})
+        rate = meta.get("regularMarketPrice")
 
         if rate is None:
-            info = ticker.info
-            rate = info.get('regularMarketPrice') or info.get('bid')
-
-        if rate is None:
-            raise HTTPException(status_code=404, detail=f"Forex pair '{from_currency}/{to_currency}' not found")
-
-        converted_amount = rate * amount
+            raise HTTPException(
+                status_code=404,
+                detail=f"Forex pair {from_currency}/{to_currency} not found",
+            )
 
         return {
             "from_currency": from_currency.upper(),
             "to_currency": to_currency.upper(),
             "rate": float(rate),
             "amount": float(amount),
-            "converted_amount": float(converted_amount),
-            "timestamp": datetime.utcnow().isoformat() + "Z"
+            "converted_amount": round(float(rate) * amount, 4),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"yfinance service error: {str(e)}")
-
-
-# Import pandas for isna check in history endpoint
-import pandas as pd
+        raise HTTPException(status_code=503, detail=f"Yahoo Finance error: {e}")
 
 
 if __name__ == "__main__":
