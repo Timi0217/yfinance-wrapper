@@ -66,8 +66,10 @@ body{background:#0a0a0a;color:#fff;font-family:system-ui,-apple-system,sans-seri
 .container{max-width:640px;margin:0 auto;opacity:0;animation:fadeIn .6s ease forwards}
 @keyframes fadeIn{to{opacity:1}}
 .header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.title{font:italic 28px ui-monospace,monospace;color:#C2185B}
-.badge{background:rgba(34,197,94,.15);color:#22c55e;font-size:11px;padding:4px 10px;border-radius:12px;font-weight:600;letter-spacing:.5px}
+.title{font:700 28px ui-monospace,monospace;color:#C2185B}
+.health{font-family:ui-monospace,monospace;font-size:13px;color:#555;display:flex;align-items:center;gap:6px}
+.health .d{width:8px;height:8px;border-radius:50%;background:#555;transition:background .3s}
+.health .d.on{background:#4CAF50}
 .subtitle{color:#888;font-size:14px;margin-bottom:32px}
 .card{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:20px;margin-bottom:24px}
 .section-title{font-size:11px;font-weight:700;letter-spacing:1.5px;color:#666;margin-bottom:16px}
@@ -101,7 +103,7 @@ body{background:#0a0a0a;color:#fff;font-family:system-ui,-apple-system,sans-seri
 <div class="container">
 <div class="header">
 <div class="title">Yahoo Finance</div>
-<div class="badge" id="health">HEALTHY</div>
+<div class="health"><span class="d" id="dot"></span><span id="health-text">connecting...</span></div>
 </div>
 <div class="subtitle">Stock quotes, historical OHLCV, and forex rates</div>
 
@@ -118,14 +120,14 @@ body{background:#0a0a0a;color:#fff;font-family:system-ui,-apple-system,sans-seri
 <div class="form-section">
 <div class="input-group">
 <input class="input" id="symbolInput" placeholder="AAPL" maxlength="10">
-<button class="btn" onclick="fetchQuote()">\\u2192 quote</button>
+<button class="btn" onclick="fetchQuote()">&rarr; quote</button>
 </div>
 <div class="try-line">
 <span>Try:</span>
-<span class="try-link" onclick="trySymbol('TSLA')">TSLA</span> \\u00B7
-<span class="try-link" onclick="trySymbol('MSFT')">MSFT</span> \\u00B7
-<span class="try-link" onclick="trySymbol('GOOGL')">GOOGL</span> \\u00B7
-<span class="try-link" onclick="trySymbol('NVDA')">NVDA</span> \\u00B7
+<span class="try-link" onclick="trySymbol('TSLA')">TSLA</span> &middot;
+<span class="try-link" onclick="trySymbol('MSFT')">MSFT</span> &middot;
+<span class="try-link" onclick="trySymbol('GOOGL')">GOOGL</span> &middot;
+<span class="try-link" onclick="trySymbol('NVDA')">NVDA</span> &middot;
 <span class="try-link" onclick="trySymbol('META')">META</span>
 </div>
 <div class="loading" id="loading">Fetching...</div>
@@ -143,15 +145,20 @@ const FOREX_PAIRS = [
 ];
 
 async function loadData(){
+  const t0 = Date.now();
   const healthP = fetch('/health').then(r=>r.json()).catch(()=>({status:'error'}));
   const quotesP = STOCKS.map(s=>fetch('/quote?symbol='+s).then(r=>r.json()).catch(()=>null));
   const forexP = FOREX_PAIRS.map(p=>fetch('/forex?from_currency='+p.from+'&to_currency='+p.to).then(r=>r.json()).catch(()=>null));
 
   const [health,...quotes] = await Promise.all([healthP,...quotesP,...forexP]);
 
-  document.getElementById('health').textContent = health.status==='healthy'?'HEALTHY':'OFFLINE';
-  document.getElementById('health').style.background = health.status==='healthy'?'rgba(34,197,94,.15)':'rgba(239,68,68,.15)';
-  document.getElementById('health').style.color = health.status==='healthy'?'#22c55e':'#ef4444';
+  const ms = Date.now() - t0;
+  if(health.status==='healthy'){
+    document.getElementById('dot').classList.add('on');
+    document.getElementById('health-text').textContent = 'online \u00B7 '+ms+'ms';
+  } else {
+    document.getElementById('health-text').textContent = 'offline';
+  }
 
   const marketHtml = quotes.slice(0,4).map((q,i)=>{
     if(!q || !q.current_price) return '';
